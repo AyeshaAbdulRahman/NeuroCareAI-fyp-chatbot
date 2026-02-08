@@ -236,7 +236,7 @@ class ChatHandler:
         # 3. Translate and Correct
         user_input_english = self._translate_text(user_input, "English") if self.user_language != "English" else user_input
         corrected_english = self.correct_query(user_input_english)
-        print(f"DEBUG: Original: {user_input_english}, Corrected: {corrected_english}")
+        
 
         # 4. Contextualize
         search_query = self._contextualize_query(corrected_english)
