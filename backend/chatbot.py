@@ -52,7 +52,180 @@ except Exception as e:
     print(f"⚠️ SymSpell dictionary not found or failed to load: {e}. Spell correction may be less accurate.")
 
 # ──────────────────────────────
-# 2. ChatHandler Class
+# 2. RetrievalTool Class
+# ──────────────────────────────
+class RetrievalTool:
+    def __init__(self, index, chunks, embedder):
+        self.index = index
+        self.chunks = chunks
+        self.embedder = embedder
+
+    def retrieve(self, query: str, k=5, max_distance=1.0) -> List[Dict[str, Any]]:
+        if self.index is None or not self.chunks:
+            return []
+
+        query_vec = self.embedder.encode([query])
+        D, I = self.index.search(np.array(query_vec).astype("float32"), k)
+        results = []
+
+        for distance, idx in zip(D[0], I[0]):
+            if idx >= len(self.chunks) or distance > max_distance:
+                continue
+
+            doc = self.chunks[idx]
+            results.append({
+                "chunk_id": doc["chunk_id"],
+                "text": doc["text"],
+                "metadata": doc["metadata"],
+                "distance": float(distance)
+            })
+        return results
+
+# ──────────────────────────────
+# 3. Agent Class
+# ──────────────────────────────
+class Agent:
+    def __init__(self, retrieval_tool, llm_client, provider, max_loops=3):
+        self.retrieval_tool = retrieval_tool
+        self.llm_client = llm_client
+        self.provider = provider
+        self.max_loops = max_loops
+
+    def _run_llm_prompt(self, prompt: str, model: str = "mistral-small-latest", max_tokens: int = 256) -> str:
+        if not self.llm_client:
+            return ""
+        try:
+            if self.provider == "openai":
+                response = self.llm_client.invoke(prompt)
+                response = response.content if hasattr(response, 'content') else str(response)
+            else:
+                resp = self.llm_client.chat.complete(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.0
+                )
+                response = resp.choices[0].message.content
+            return response.strip()
+        except Exception as e:
+            return ""
+
+    def _decide_retrieval(self, query: str, current_context: str, history: List[Dict[str, str]]) -> str:
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-5:]])  # Last 5 for brevity
+
+        prompt = f"""
+        You are an agent deciding whether to retrieve information from documents for the query.
+
+        Query: {query}
+        Current Context: {current_context}
+        Chat History: {history_text}
+
+        Decide: Should I retrieve more information? Answer 'yes' or 'no'. If 'no', I will generate a response without retrieval.
+        """
+        decision = self._run_llm_prompt(prompt, max_tokens=10).lower().strip()
+        return "retrieve" if decision == "yes" else "no_retrieval"
+
+    def _is_sufficient(self, docs: List[Dict[str, Any]], query: str) -> bool:
+        if not docs:
+            return False
+        context = "\n".join([d["text"] for d in docs])
+        prompt = f"""
+        Does the following context sufficiently answer the query: {query}?
+
+        Context: {context}
+
+        Answer 'yes' or 'no'.
+        """
+        answer = self._run_llm_prompt(prompt, max_tokens=10).lower().strip()
+        return answer == "yes"
+
+    def _format_context(self, docs: List[Dict[str, Any]]) -> str:
+        if not docs:
+            return ""
+        return "\n\n".join([f"[Source: {r['metadata'].get('source', 'Unknown')}]\n{r['text']}" for r in docs])
+
+    def _extract_references(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        references = []
+        for r in docs:
+            references.append({
+                "chunk_id": r["chunk_id"],
+                "source": r["metadata"].get("source", "Unknown"),
+                "page": r["metadata"].get("page", "N/A"),
+                "chunk_index": r["metadata"].get("chunk_index", 0)
+            })
+        return references
+
+    def _generate_response(self, query: str, context: str, history: List[Dict[str, str]], user_language: str) -> str:
+        history_block = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in history[-5:]])
+
+        no_info_message = "The available documents do not contain information about this topic."
+        translated_no_info = no_info_message  # Translation handled in ChatHandler
+
+        system_prompt = f"""
+You are a compassionate NeuroCare AI Assistant specializing in Alzheimer’s, Parkinson’s, Dementia, and FTD.
+Your ONLY goal is to provide a helpful response.
+
+**CRITICAL INSTRUCTIONS:**
+1. **Answer ONLY using the provided [CONTEXT]**.
+2. If the answer is **NOT** found in the [CONTEXT], your entire reply MUST be: "{translated_no_info}"
+3. **Generate the entire response ONLY in the following language: English.**  # Agent generates in English, ChatHandler translates
+4. DO NOT use other languages in the final reply. DO NOT include any introductory phrases, translation preambles, or meta-text.
+
+[CONTEXT]
+{context}
+
+[HISTORY]
+{history_block}
+"""
+        final_prompt = f"{system_prompt}\n\nUSER: {query}\nASSISTANT:"
+
+        try:
+            if self.provider == "openai":
+                response = self.llm_client.invoke(final_prompt)
+                reply = response.content if hasattr(response, 'content') else str(response)
+            else:
+                resp = self.llm_client.chat.complete(
+                    model="mistral-small-latest",
+                    messages=[{"role": "user", "content": final_prompt}],
+                    max_tokens=600,
+                    temperature=0.3
+                )
+                reply = resp.choices[0].message.content
+        except Exception as e:
+            reply = "I'm sorry, I encountered an error connecting to the AI service."
+
+        return reply
+
+    def process_query(self, query: str, history: List[Dict[str, str]], user_language: str) -> tuple[str, List[Dict[str, Any]]]:
+        context = ""
+        loop_count = 0
+        all_docs = []
+
+        while loop_count < self.max_loops:
+            decision = self._decide_retrieval(query, context, history)
+            if decision == "no_retrieval":
+                response = self._generate_response(query, "", history, user_language)
+                return response, []
+
+            elif decision == "retrieve":
+                docs = self.retrieval_tool.retrieve(query)
+                all_docs.extend(docs)
+                if self._is_sufficient(docs, query):
+                    context = self._format_context(all_docs)
+                    response = self._generate_response(query, context, history, user_language)
+                    references = self._extract_references(all_docs)
+                    return response, references
+                else:
+                    context += self._format_context(docs)
+                    loop_count += 1
+
+        # Max loops reached
+        response = self._generate_response(query, context, history, user_language)
+        references = self._extract_references(all_docs)
+        return response, references
+
+# ──────────────────────────────
+# 4. ChatHandler Class
 # ──────────────────────────────
 class ChatHandler:
     def __init__(self):
@@ -75,6 +248,10 @@ class ChatHandler:
         else:
             print("⚠️ No API Key found. Chat will fail.")
             self.llm_client = None
+
+        # Initialize RetrievalTool and Agent
+        self.retrieval_tool = RetrievalTool(index, chunks, embedder)
+        self.agent = Agent(self.retrieval_tool, self.llm_client, self.provider)
 
         self.chat_history: List[Dict[str, str]] = []
         self.max_history = 10
@@ -236,79 +413,19 @@ class ChatHandler:
         # 3. Translate and Correct
         user_input_english = self._translate_text(user_input, "English") if self.user_language != "English" else user_input
         corrected_english = self.correct_query(user_input_english)
-        
 
         # 4. Contextualize
         search_query = self._contextualize_query(corrected_english)
 
-        # 5. Retrieve
-        retrieved_docs = self.retrieve_relevant_docs(search_query)
-        print(f"DEBUG: Retrieved {len(retrieved_docs)} docs")
+        # 5. Use Agent for RAG Processing
+        reply, references = self.agent.process_query(search_query, self.chat_history, self.user_language)
 
-        # Format Context
-        references = []
-        context_text_list = []
-        if retrieved_docs:
-            for r in retrieved_docs:
-                context_text_list.append(f"[Source: {r['metadata'].get('source', 'Unknown')}]\n{r['text']}")
-                references.append({
-                    "chunk_id": r["chunk_id"],
-                    "source": r["metadata"].get("source", "Unknown"),
-                    "page": r["metadata"].get("page", "N/A"),
-                    "chunk_index": r["metadata"].get("chunk_index", 0)
-                })
-            context_text = "\n\n".join(context_text_list)
-        else:
-            context_text = ""
-
-        # 6. No-Info Message
-        no_info_message = "The available documents do not contain information about this topic."
-        translated_no_info = self._translate_text(no_info_message, self.user_language) if self.user_language != "English" else no_info_message
-
-        # 7. System Prompt
-        history_block = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in self.chat_history[-self.max_history:]])
-
-        system_prompt = f"""
-You are a compassionate NeuroCare AI Assistant specializing in Alzheimer’s, Parkinson’s, Dementia, and FTD.
-Your ONLY goal is to provide a helpful response.
-
-**CRITICAL INSTRUCTIONS:**
-1. **Answer ONLY using the provided [CONTEXT]**.
-2. If the answer is **NOT** found in the [CONTEXT], your entire reply MUST be: "{translated_no_info}"
-3. **Generate the entire response ONLY in the following language: {self.user_language}.**
-4. DO NOT use English in the final reply. DO NOT include any introductory phrases, translation preambles, or meta-text.
-
-[CONTEXT]
-{context_text}
-
-[HISTORY]
-{history_block}
-"""
-        final_prompt = f"{system_prompt}\n\nUSER: {search_query}\nASSISTANT:"
-
-        # 8. Generate
-        try:
-            if self.provider == "openai":
-                response = self.llm_client.invoke(final_prompt)
-                reply = response.content if hasattr(response, 'content') else str(response)
-            else:
-                resp = self.llm_client.chat.complete(
-                    model="mistral-small-latest",
-                    messages=[{"role": "user", "content": final_prompt}],
-                    max_tokens=600,
-                    temperature=0.3
-                )
-                reply = resp.choices[0].message.content
-        except Exception as e:
-            error_msg = "I'm sorry, I encountered an error connecting to the AI service."
-            reply = self._translate_text(error_msg, self.user_language) if self.user_language != "English" else error_msg
-
-        # 9. Translate Reply to User's Language (if needed)
+        # 6. Translate Reply to User's Language (if needed)
         if self.user_language != "English":
             reply = self._translate_text(reply, self.user_language)
 
-        # 10. Update History (Only if docs were retrieved to avoid polluting with off-topic)
-        if retrieved_docs:
+        # 7. Update History (Only if docs were retrieved to avoid polluting with off-topic)
+        if references:
             self.chat_history.append({"role": "user", "content": user_input})
             self.chat_history.append({"role": "assistant", "content": reply})
 
